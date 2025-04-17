@@ -1,57 +1,52 @@
 # Plex for Channels
 
-Current version: **4.04**
+## About
 
-# About
-Generates M3U playlists and EPG XMLTV files from Plex linear feeds.
+**Plex for Channels** is a utility for generating dynamic `.m3u` playlists and `epg.xml` files from Plex's linear TV feed, suitable for IPTV clients such as Jellyfin, Channels DVR, and others.
 
-If you like this and other linear containers for Channels that I have created, please consider supporting my work.
+This project is a fork of the original [jgomez177/plex-for-channels](https://github.com/jgomez177/plex-for-channels), with significant improvements in HLS proxying, token handling, dynamic routing, logo caching, and EPG integration.
 
-[![](https://pics.paypal.com/00/s/MDY0MzZhODAtNGI0MC00ZmU5LWI3ODYtZTY5YTcxOTNlMjRm/file.PNG)](https://www.paypal.com/donate/?hosted_button_id=BBUTPEU8DUZ6J)
+## Running
 
-Or Even Better support the Girl Scouts with the purchase of cookies for the 2025 campaign:
+The recommended way to run is using the published Docker container:
 
-Site 1
-[<img src="https://townsquare.media/site/191/files/2024/01/attachment-cookie.jpg" width=400/>](https://digitalcookie.girlscouts.org/scout/charlotte816794)
+```bash
+docker run -d --restart unless-stopped --network=host \
+    -e PORT=[your_port_number_here] \
+    --name plex-for-channels \
+    ghcr.io/kronflux/plex-for-channels
+```
 
-Site 2
-[<img src="https://townsquare.media/site/191/files/2024/01/attachment-cookie.jpg" width=400/>](https://digitalcookie.girlscouts.org/scout/mckenna899691)
+Alternatively:
 
-# Changes
- - Version 4.04
-   - EPG Updates
- - Version 4.03a
-   - Even More Memory Optmizations
- - Version 4.02
-   - More Updates
- - Version 4.01
-   - Corrected memory issues and parsing
- - Version 4.00
-   - Total revamp of Plex Project!!!
-   - Improved threading capability, updated web interface
-   - Removed need for PLEX_CODE variable, now handled through url parameters
-   - PLEX_PORT has been modified to PORT
+```bash
+docker run -d --restart unless-stopped \
+    -p [your_port_number_here]:7777 \
+    --name plex-for-channels \
+    ghcr.io/kronflux/plex-for-channels
+```
 
-# Running
-The recommended way of running is to pull the image from [GitHub](https://github.com/jgomez177/plex-for-channels/pkgs/container/plex-for-channels).
+Once running, access the status page to retrieve the playlist and EPG URLs:
 
-    docker run -d --restart unless-stopped --network=host -e PORT=[your_port_number_here] --name  plex-for-channels ghcr.io/jgomez177/plex-for-channels
-or
+```
+http://127.0.0.1:[your_port_number_here]
+```
 
-    docker run -d --restart unless-stopped -p [your_port_number_here]:7777 --name  plex-for-channels ghcr.io/jgomez177/plex-for-channels
+## Environment Variables
 
-You can retrieve the playlist and EPG via the status page.
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PORT`   | Port the server listens on. Override if necessary to avoid conflicts. | 7777 |
 
-    http://127.0.0.1:[your_port_number_here]
+## URL Parameters
 
-## Environement Variables
-| Environment Variable | Description | Default |
-|---|---|---|
-| PORT | Port the API will be served on. You can set this if it conflicts with another service in your environment. | 7777 |
+These parameters can be added to the `/playlist.m3u` or `/epg.xml` request URLs.
 
-## Additional URL Parameters
-| Parameter | Description | Default
-|---|---|---|
-| gracenote | "include" will utilize gracenote EPG information and filter to those streams utilizing Gracenote. "exclude" will filter those streams that do not have a matching gracenote EPG data. | 
-| regions | Identify regions wanted in playlist. Can utilize multiple regions | local
+| Parameter  | Description |
+|------------|-------------|
+| `regions`  | Comma-separated list of geo regions to include in the playlist. Example: `regions=local,nyc`<br>Defaults to `local`. |
+| `gracenote`| Use `include` to filter to streams that provide Gracenote EPG metadata, or `exclude` to filter those out. |
 
+---
+
+For updates, see the [Releases](https://github.com/kronflux/plex-for-channels/releases) page.

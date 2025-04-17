@@ -1,3 +1,7 @@
+"""
+plex.py - Core logic for managing Plex channel metadata, EPG data, and playlist generation.
+"""
+
 import threading, json, random, string, time
 import re, requests, csv, os, gzip, pytz, shutil, gc, itertools
 from urllib.parse import urlencode
@@ -10,6 +14,7 @@ from urllib3.util.retry import Retry
 from xml.sax.saxutils import escape
 
 class Client:
+# ==== Init ====
     def __init__(self):
         self.lock = threading.Lock()
         self.client_name = 'plex'
@@ -24,44 +29,241 @@ class Client:
         self.tokenResponses = {}
         self.token_keychain = {}
         self.update_today_epg = 0
-        self.x_forward = {"local": "",
-                          "clt": "108.82.206.181",
-                          "sea": "159.148.218.183",
-                          "dfw": "76.203.9.148",
-                          "nyc": "85.254.181.50",
-                          "la": "76.81.9.69",
-                        }
+        self.x_forward = {
+            "local": "",
+            "clt": "108.82.206.181",
+            "sea": "159.148.218.183",
+            "dfw": "76.203.9.148",
+            "nyc": "85.254.181.50",
+            "la": "76.81.9.69",
+        }
         self.headers = {
-                        'Accept': 'application/json, text/plain, */*',
-                        'Accept-Language': 'en',
-                        'Connection': 'keep-alive',
-                        'Origin': 'https://app.plex.tv',
-                        'Referer': 'https://app.plex.tv/',
-                        'Sec-Fetch-Dest': 'empty',
-                        'Sec-Fetch-Mode': 'cors',
-                        'Sec-Fetch-Site': 'same-site',
-                        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
-                        'sec-ch-ua': '"Not A(Brand";v="8", "Chromium";v="132", "Google Chrome";v="132"',
-                        'sec-ch-ua-mobile': '?0',
-                        'sec-ch-ua-platform': '"macOS"',
-                        }
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Connection': 'keep-alive',
+            'Origin': 'https://app.plex.tv',
+            'Referer': 'https://app.plex.tv/',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-site',
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+            'sec-ch-ua': '"Not A(Brand";v="8", "Chromium";v="132", "Google Chrome";v="132"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"macOS"',
+        }
         self.params = {
-                        'X-Plex-Product': 'Plex Web',
-                        'X-Plex-Version': '4.145.0',
-                        'X-Plex-Platform': 'Chrome',
-                        'X-Plex-Platform-Version': '132.0',
-                        'X-Plex-Features': 'external-media,indirect-media,hub-style-list',
-                        'X-Plex-Model': 'standalone',
-                        'X-Plex-Device': 'OSX',
-                        'X-Plex-Device-Screen-Resolution': '1758x627,1920x1080',
-                        'X-Plex-Provider-Version': '7.2',
-                        'X-Plex-Text-Format': 'plain',
-                        'X-Plex-Drm': 'widevine',
-                        'X-Plex-Language': 'en',
-                        }
+            'X-Plex-Product': 'Plex Web',
+            'X-Plex-Version': '4.145.0',
+            'X-Plex-Platform': 'Chrome',
+            'X-Plex-Platform-Version': '132.0',
+            'X-Plex-Features': 'external-media,indirect-media,hub-style-list',
+            'X-Plex-Model': 'standalone',
+            'X-Plex-Device': 'OSX',
+            'X-Plex-Device-Screen-Resolution': '1758x627,1920x1080',
+            'X-Plex-Provider-Version': '7.2',
+            'X-Plex-Text-Format': 'plain',
+            'X-Plex-Drm': 'widevine',
+            'X-Plex-Language': 'en',
+        }
         self.load_device()
         self.load_custom_geo_codes()
-        
+        self._start_token_refresh_thread()
+
+
+# ==== Token Management ====
+    def call_token_api(self, local_headers, local_params, local_token_sessionAt, tokenResponse):
+        url = 'https://clients.plex.tv/api/v2/users/anonymous'
+        error = None
+        local_token_expires_in = self.token_expires_in
+        local_client_name = self.client_name
+
+        if self.isTimeExpired(local_token_sessionAt, local_token_expires_in) or (tokenResponse is None):
+            # print(f"[INFO - {self.client_name.upper()}] Call {local_client_name} Token API Call")
+            local_token_sessionAt = time.time()
+            session = requests.Session()
+            try:
+                tokenResponse = session.post(url, params=local_params, headers=local_headers)
+            except requests.ConnectionError as e:
+                error = f"Connection Error. {str(e)}"
+            finally:
+                # print(f'[INFO - {self.client_name.upper()}] Close {local_client_name} Token API session')
+                session.close()
+                del session
+                gc.collect()
+        # else:
+        #     print(f"[INFO - {self.client_name.upper()}] Return {local_client_name} Cached Token Response")
+
+        if error:
+            print(error)
+            return None, None, None, error
+
+        if tokenResponse.status_code not in (200, 201):
+            print(f"HTTP: {tokenResponse.status_code}: {tokenResponse.text}")
+            return None, None, None, tokenResponse.text
+        else:
+            resp = tokenResponse.json()
+
+        # print(json.dumps(resp, indent = 2))
+        # with self.lock:
+        #    self.tokenResponse = tokenResponse
+        # access_token = resp.get('authToken', None)
+        return (tokenResponse, local_token_sessionAt, error)
+
+    def generate_geo_list(self, args):
+        geo_list = ['local']
+        if args and args.get('regions'):
+            geo_list = [region.strip() for region in args['regions'].split(',')]
+            geo_list = list(set(geo_list))
+        return geo_list
+
+    def token(self, args):
+        import inspect
+        print(f"[DEBUG] token() call depth: {len(inspect.stack())}")
+        error= None
+        geo_list = self.generate_geo_list(args)
+
+        token_headers=self.headers.copy()
+        token_params=self.params.copy()
+        local_tokenResponses=self.tokenResponses.copy()
+        local_token_keychain = self.token_keychain.copy()
+        local_x_forward = self.x_forward.copy()
+        local_token_expires_in = self.token_expires_in
+
+        for geo_code in geo_list:
+            if geo_code not in local_x_forward.keys():
+                error = f'[ERROR - {self.client_name.upper()}] Geo Code {geo_code} Not Found'
+                print(error)
+                return None, error
+
+            token_headers.update({"X-Forwarded-For": local_x_forward.get(geo_code)})
+            tokenResponse = local_tokenResponses.get(geo_code)
+            tokenResponse, local_token_sessionAt, error = self.call_token_api(token_headers, token_params, local_token_keychain.get(geo_code, {}).get('token_sessionAt', 0), tokenResponse)
+
+            if error: return None, error
+
+            resp = tokenResponse.json()
+
+            access_token = resp.get('authToken', None)
+            if not access_token:
+                error = f'[ERROR - {self.client_name.upper()}] No Token located for {geo_code}'
+                print(error)
+                return None, error
+
+            local_tokenResponses.update({geo_code: tokenResponse})
+
+            local_key = {"access_token": access_token,
+                         "token_sessionAt": local_token_sessionAt,
+                         "token_expires_in": local_token_expires_in,
+                         }
+
+            local_token_keychain.update({geo_code: local_key})
+        # print(json.dumps(local_token_keychain, indent=2))
+        # print(local_tokenResponses)
+
+        with self.lock:
+            self.token_keychain = local_token_keychain
+            self.tokenResponses = local_tokenResponses
+        return local_token_keychain, error
+
+    def call_genre_api(self, local_headers):
+        error = None
+        url = 'https://epg.provider.plex.tv/'
+        local_client_name = self.client_name
+        local_params = self.params.copy()
+
+        session = requests.Session()
+        try:
+            response = session.get(url, params=local_params, headers=local_headers, timeout=300)
+        except requests.ConnectionError as e:
+            error = f"[ERROR - {self.client_name.upper()}:call_genre_api] Connection Error. {str(e)}"
+            print(error)
+        finally:
+            session.close()
+            del session
+            gc.collect()
+
+        if error: return None
+        if response.status_code != 200:
+            print(f'[ERROR - {self.client_name.upper()}:call_genre_api] {local_client_name} HTTP Failure {response.status_code}')
+            return None
+
+        resp = response.json()
+        genres_temp = {}
+
+        feature = resp.get('MediaProvider', {}).get('Feature',[])
+        for elem in feature:
+            if 'GridChannelFilter' in elem:
+                genres_temp = elem.get('GridChannelFilter')
+                break
+
+        genres = {}
+        for genre in genres_temp:
+            genres.update({genre.get('identifier'): genre.get('title')})
+
+        return genres
+
+    def update_gracenote_tmsids(self, listing):
+        plex_tmsid_url = "https://raw.githubusercontent.com/jgomez177/plex-for-channels/main/plex_tmsid.csv"
+        plex_custom_tmsid = 'plex_data/plex_custom_tmsid.csv'
+
+        session = requests.Session()
+        try:
+            # print(f'[INFO - {self.client_name.upper()}] Call {local_client_name} Genre API')
+            response = session.get(plex_tmsid_url, timeout=300)
+        except requests.ConnectionError as e:
+            error = f"Connection Error. {str(e)}"
+            print(f'[ERROR - {self.client_name.upper()}] {error}')
+            print(f'[ERROR - {self.client_name.upper()}] Unable to access TMSID Data. No changes made.')
+            return listing
+        finally:
+            # print(f'[INFO - {self.client_name.upper()}] Close {local_client_name} Genre API session')
+            session.close()
+            del session
+            gc.collect()
+
+        # Check if request was successful
+        if response.status_code == 200:
+            # Read in the CSV data
+            reader = csv.DictReader(response.text.splitlines())
+        else:
+            print(f'[ERROR - {self.client_name.upper()}] {response.status_code}: Unable to access TMSID Data. No changes made.')
+            return listing
+
+        tmsid_dict = {}
+        tmsid_custom_dict = {}
+
+        for row in reader:
+            tmsid_dict[row['id']] = row
+
+        if os.path.exists(plex_custom_tmsid):
+            # File exists, open it
+            with open(plex_custom_tmsid, mode='r') as file:
+                reader = csv.DictReader(file)
+                for row in reader:
+                    tmsid_custom_dict[row['id']] = row
+
+        tmsid_dict.update(tmsid_custom_dict)
+        # print(json.dumps(tmsid_dict, indent=2))
+
+        filtered_tmsid = {k: v for k, v in tmsid_dict.items() if v.get("tmsid")}
+
+        print(f'[INFO - {self.client_name.upper()}] Updating TMSID for {len(filtered_tmsid)} items')
+        for elem in listing:
+            key = listing.get(elem).get('id')
+
+            if (tmsid_data := filtered_tmsid.get(key)):
+                update_data = {'tmsid': tmsid_data['tmsid']}
+
+                if tmsid_data.get('time_shift'):
+                    update_data['time_shift'] = tmsid_data['time_shift']
+
+                listing[elem].update(update_data)
+
+        #print(json.dumps(listing, indent=2))
+        return listing
+
+
+# ==== Geo Region ====
     def parse_newregion(self, newregion):
         parsed_data = {}
         try:
@@ -87,10 +289,6 @@ class Client:
             with self.lock:
                 self.x_forward = local_x_forward
         return parsed_data
-
-    def isTimeExpired(self, sessionAt, age):
-        # print ((time.time() - sessionAt) >= age)
-        return ((time.time() - sessionAt) >= age)
 
     def load_custom_geo_codes(self):
         client_name = self.client_name.lower()
@@ -129,333 +327,11 @@ class Client:
         with self.lock:
             self.device_id = device_id
             self.params = params
+            self.headers['x-plex-client-identifier'] = self.device_id
         return
 
-    def url_encode(self, base_url, params):
-        query_string = urlencode(params)
-        full_url = f"{base_url}?{query_string}" if query_string else base_url
-        return full_url
 
-    def body_text(self, provider, host, geo_code_list):
-
-        local_x_forward = self.x_forward.copy()
-        local = ['local']
-        base_url = f"http://{host}/{provider}/playlist.m3u"
-
-        body_text = f'<p class="title is-4">{provider.capitalize()} Playlist</p>'
-
-        options = '<span class="tag is-link is-light is-medium is-rounded mb-5">Multiple Region parameters can be used with comma seperator. Example: playlist.m3u?regions=local,la</span>'
-        options += '<div class="columns is-multiline is-variable is-5">'
-        for elem in local_x_forward:
-            options += ''
-            options += '<div class="column is-one-quarter mb-0"><div class="button is-info is-dark">'
-            if elem != 'local':
-                params = {'regions': elem}
-            else:
-                params = {}
-            full_url = self.url_encode(base_url, params)
-            options += f'<a href="{full_url}" class="has-text-white">{elem.upper()} Playlist Default</a>'
-            options += '</div></div>'
-            options += '<div class="column is-one-quarter mb-0"><div class="button is-info is-dark">'
-            params.update({'compatibility': 'matthuisman'})
-            full_url = self.url_encode(base_url, params)
-            options += f'<a href="{full_url}" class="has-text-white">{elem.upper()} Playlist Type MJH</a>'
-            params.pop('compatibility', None)
-            options += '</div></div>'
-            options += '<div class="column is-one-quarter mb-0"><div class="button is-info is-dark">'
-            params.update({'gracenote': 'include'})
-            full_url = self.url_encode(base_url, params)
-            options += f'<a href="{full_url}" class="has-text-white">{elem.upper()} Gracenote Playlist</a>'
-            options += '</div></div>'
-            options += '<div class="column is-one-quarter mb-0"><div class="button is-info is-dark">'
-            params.update({'gracenote': 'exclude'})
-            full_url = self.url_encode(base_url, params)
-            options += f'<a href="{full_url}" class="has-text-white">{elem.upper()} Playlist No Gracenote</a>'
-            options += '</div></div>'
-        options += '</div>'
-
-        tools = '<div class="columns is-multiline is-variable is-5">'
-        tools += '<div class="column is-third mb-0"><div class="button is-danger is-dark">'
-        tools += f'<a href="http://{host}/{provider}/rebuild_epg" class="has-text-white">Rebuild EPG</a>'
-        tools += '</div></div>'
-        tools += '<div class="column is-third mb-0"><div class="button is-primary is-dark">'
-        tools += f'<a href="http://{host}/{provider}/epg.xml" class="has-text-white">EPG</a>'
-        tools += '</div></div>'
-        tools += '<div class="column is-third mb-0"><div class="button is-primary is-dark">'
-        tools += f'<a href="http://{host}/{provider}/epg.xml.gz" class="has-text-white">EPG GZ</a>'
-        tools += '</div></div>'
-        tools += '</div>'
-
-        return(f'{body_text}{tools}{options}')
-
-    def generate_group_listing(self, token, geo_code):
-        error = None
-        local_headers = self.headers.copy()
-        local_x_forward = self.x_forward.copy()
-
-        if geo_code in local_x_forward.keys():
-            local_headers.update({"X-Forwarded-For": local_x_forward.get(geo_code)})
-
-        group_listing = local_headers
-        return group_listing, error
-    
-    def generate_m3u(self, provider, listings, gracenote, channel_id_type):
-        local_token_keychain = self.token_keychain.copy()
-
-        m3u = "#EXTM3U\r\n\r\n"
-        for s in listings:
-            token = local_token_keychain.get(s.get('geo_code',''),{}).get('access_token')
-            if channel_id_type == 'matthuisman':
-                m3u += f"#EXTINF:-1 channel-id=\"{provider}-{s.get('id')}\""
-            else:
-                m3u += f"#EXTINF:-1 channel-id=\"{provider}-{s.get('slug')}\""
-            m3u += f" tvg-id=\"{s.get('id')}\""
-            m3u += f" tvg-chno=\"{s.get('number')}\"" if s.get('number') else ""
-            m3u += f" tvg-logo=\"{''.join(map(str, s.get('logo', [])))}\"" if s.get('logo') else ""
-            m3u += f" tvg-name=\"{s.get('call_sign')}\"" if s.get('call_sign') else ""
-            if gracenote == 'include':
-                m3u += f" tvg-shift=\"{s.get('time_shift')}\"" if s.get('time_shift') else ""
-                m3u += f" tvc-guide-stationid=\"{s.get('tmsid')}\"" if s.get('tmsid') else ""
-            m3u += f" group-title=\"{''.join(map(str, s.get('group', [])))}\"" if s.get('group') else ""
-            m3u += f",{s.get('name') or s.get('call_sign')}\n"
-            m3u += f"https://epg.provider.plex.tv{s.get('key')}?X-Plex-Token={token}\n\n"
-        return m3u
-    
-    def generate_playlist(self, provider, args, host):
-        error = None        
-        station_dict, error = self.channels(args)
-        if error: return None, error
-
-        geo_list = self.generate_geo_list(args)
-        # print(f'[INFO - {self.client_name.upper()}] generate_playlist: {geo_list}')
-
-        playlist_dict = {}
-        for geo_code in geo_list:
-            channels_by_geo = station_dict.get(geo_code)
-            for ch in channels_by_geo:
-                if not (ch in playlist_dict):
-                    station_data = channels_by_geo.get(ch)
-                    station_data.update({'geo_code': geo_code})
-                    playlist_dict.update({ch: station_data})
-
-            # print(f'[INFO - {self.client_name.upper()}] generate_playlist Playlist: {len(playlist_dict)}')
-
-        # listings = sorted(playlist_dict.values(), key = lambda i: i.get('name', ''))
-        listings = sorted(
-            playlist_dict.values(), 
-            key=lambda i: (
-                            (i.get('call_sign') is None, i.get('call_sign', '')),
-                            i.get('tmsid') is None, 
-                            i.get('name').lower() or '')      
-            )
-        
-        print(f'[INFO - {self.client_name.upper()}] Full Playlist: {len(listings)}')
-
-        gracenote = args.get('gracenote')
-        if gracenote == 'include':
-            listings = list(filter(lambda d: d.get('tmsid'), listings))
-            print(f'[INFO - {self.client_name.upper()}] Gracenote Playlist: {len(listings)}')
-        elif gracenote == 'exclude':
-            listings = list(filter(lambda d: d.get('tmsid', None) is None, listings))
-            print(f'[INFO - {self.client_name.upper()}] No Gracenote Playlist: {len(listings)}')
-
-        channel_id_type = args.get('compatibility')
-
-        m3u = self.generate_m3u(provider, listings, gracenote, channel_id_type)
-        return m3u, error                        
-
-    def call_token_api(self, local_headers, local_params, local_token_sessionAt, tokenResponse):
-        url = 'https://clients.plex.tv/api/v2/users/anonymous'
-        error = None
-        local_token_expires_in = self.token_expires_in
-        local_client_name = self.client_name
-        
-        if self.isTimeExpired(local_token_sessionAt, local_token_expires_in) or (tokenResponse is None):
-            # print(f"[INFO - {self.client_name.upper()}] Call {local_client_name} Token API Call")
-            local_token_sessionAt = time.time()
-            session = requests.Session()
-            try:
-                tokenResponse = session.post(url, params=local_params, headers=local_headers)
-            except requests.ConnectionError as e:
-                error = f"Connection Error. {str(e)}"
-            finally:
-                # print(f'[INFO - {self.client_name.upper()}] Close {local_client_name} Token API session')
-                session.close()
-                del session
-                gc.collect()
-        # else:
-        #     print(f"[INFO - {self.client_name.upper()}] Return {local_client_name} Cached Token Response")
-
-        if error:
-            print(error)
-            return None, None, None, error
-
-        if tokenResponse.status_code not in (200, 201):
-            print(f"HTTP: {tokenResponse.status_code}: {tokenResponse.text}")
-            return None, None, None, tokenResponse.text
-        else:
-            resp = tokenResponse.json()
-
-        # print(json.dumps(resp, indent = 2))
-        # with self.lock:
-        #    self.tokenResponse = tokenResponse
-        # access_token = resp.get('authToken', None)
-        return (tokenResponse, local_token_sessionAt, error)
-
-    def generate_geo_list(self, args):
-        geo_list = ['local']
-        if args and args.get('regions', ''):
-            geo_list = [region.strip() for region in args.get('regions', '').split(',')] if args.get('regions', '') else []
-            geo_list = list(set(geo_list))
-        return geo_list 
-
-    def token(self, args):
-        error= None
-        geo_list = self.generate_geo_list(args)
-
-        token_headers=self.headers.copy()
-        token_params=self.params.copy()
-        local_tokenResponses=self.tokenResponses.copy()
-        local_token_keychain = self.token_keychain.copy()
-        local_x_forward = self.x_forward.copy()
-        local_token_expires_in = self.token_expires_in
-
-        for geo_code in geo_list:
-            if geo_code not in local_x_forward.keys():
-                error = f'[ERROR - {self.client_name.upper()}] Geo Code {geo_code} Not Found'
-                print(error)
-                return None, error
-            
-            token_headers.update({"X-Forwarded-For": local_x_forward.get(geo_code)})
-            tokenResponse = local_tokenResponses.get(geo_code)
-            tokenResponse, local_token_sessionAt, error = self.call_token_api(token_headers, token_params, local_token_keychain.get(geo_code, {}).get('token_sessionAt', 0), tokenResponse)
-        
-            if error: return None, error
-
-            resp = tokenResponse.json()
-
-            access_token = resp.get('authToken', None)
-            if not access_token:
-                error = f'[ERROR - {self.client_name.upper()}] No Token located for {geo_code}'
-                print(error)
-                return None, error
-
-            local_tokenResponses.update({geo_code: tokenResponse})
-
-            local_key = {"access_token": access_token,
-                         "token_sessionAt": local_token_sessionAt,
-                         "token_expires_in": local_token_expires_in,
-                         }
-        
-        
-            local_token_keychain.update({geo_code: local_key})
-        # print(json.dumps(local_token_keychain, indent=2))
-        # print(local_tokenResponses)
-
-        with self.lock:
-            self.token_keychain = local_token_keychain
-            self.tokenResponses = local_tokenResponses
-        return local_token_keychain, error
-    
-    def call_genre_api(self, local_headers):
-        error = None
-        url = 'https://epg.provider.plex.tv/'
-        local_client_name = self.client_name
-        local_params = self.params.copy()
-
-        session = requests.Session()
-        try:
-            response = session.get(url, params=local_params, headers=local_headers, timeout=300)
-        except requests.ConnectionError as e:
-            error = f"[ERROR - {self.client_name.upper()}:call_genre_api] Connection Error. {str(e)}"
-            print(error)
-        finally:
-            session.close()
-            del session
-            gc.collect()
-
-        if error: return None
-        if response.status_code != 200:
-            print(f'[ERROR - {self.client_name.upper()}:call_genre_api] {local_client_name} HTTP Failure {response.status_code}')
-            return None
-
-        resp = response.json()
-        genres_temp = {}
-
-        feature = resp.get('MediaProvider', {}).get('Feature',[])
-        for elem in feature:
-            if 'GridChannelFilter' in elem:
-                genres_temp = elem.get('GridChannelFilter')
-                break
-
-        genres = {}
-        for genre in genres_temp:
-            genres.update({genre.get('identifier'): genre.get('title')})
-
-        return genres
-    
-    def update_gracenote_tmsids(self, listing):
-        plex_tmsid_url = "https://raw.githubusercontent.com/jgomez177/plex-for-channels/main/plex_tmsid.csv"
-        plex_custom_tmsid = 'plex_data/plex_custom_tmsid.csv'
-
-        session = requests.Session()
-        try:
-            # print(f'[INFO - {self.client_name.upper()}] Call {local_client_name} Genre API')
-            response = session.get(plex_tmsid_url, timeout=300)
-        except requests.ConnectionError as e:
-            error = f"Connection Error. {str(e)}"
-            print(f'[ERROR - {self.client_name.upper()}] {error}')
-            print(f'[ERROR - {self.client_name.upper()}] Unable to access TMSID Data. No changes made.') 
-            return listing
-        finally:
-            # print(f'[INFO - {self.client_name.upper()}] Close {local_client_name} Genre API session')
-            session.close()
-            del session
-            gc.collect()
-
-        # Check if request was successful
-        if response.status_code == 200:
-            # Read in the CSV data
-            reader = csv.DictReader(response.text.splitlines())
-        else:
-            print(f'[ERROR - {self.client_name.upper()}] {response.status_code}: Unable to access TMSID Data. No changes made.') 
-            return listing
-
-
-        tmsid_dict = {}
-        tmsid_custom_dict = {}
-
-        for row in reader:
-            tmsid_dict[row['id']] = row
-
-
-        if os.path.exists(plex_custom_tmsid):
-            # File exists, open it
-            with open(plex_custom_tmsid, mode='r') as file:
-                reader = csv.DictReader(file)
-                for row in reader:
-                    tmsid_custom_dict[row['id']] = row
-
-        tmsid_dict.update(tmsid_custom_dict)
-        # print(json.dumps(tmsid_dict, indent=2))
-
-        filtered_tmsid = {k: v for k, v in tmsid_dict.items() if v.get("tmsid")}
-
-        print(f'[INFO - {self.client_name.upper()}] Updating TMSID for {len(filtered_tmsid)} items')
-        for elem in listing:
-            key = listing.get(elem).get('id')
-
-            if (tmsid_data := filtered_tmsid.get(key)):
-                update_data = {'tmsid': tmsid_data['tmsid']}
-
-                if tmsid_data.get('time_shift'):  
-                    update_data['time_shift'] = tmsid_data['time_shift']
-
-                listing[elem].update(update_data)
-
-        #print(json.dumps(listing, indent=2))
-        return listing
-
+# ==== Channel Listing ====
     def generate_channels_by_geo(self, args, geo_list):
         error = None
         # print(f"[DEBUG - {self.client_name.upper()}:generate_channels_by_geo] Begin Function")
@@ -470,7 +346,7 @@ class Client:
             error = f"[ERROR - {self.client_name.upper()}:generate_channels_by_geo] No TOKEN"
             print(error)
             return None, error
-        
+
         genres = {}
         for geo_code in geo_list:
             # print(f"[DEBUG - {self.client_name.upper()}:generate_channels_by_geo] Loop {geo_code}")
@@ -502,7 +378,7 @@ class Client:
                     print(f'[INFO - {self.client_name.upper()}] No Token: Generate Token for {geo_code.upper()}')
                     token_keychain = self.token({'regions': geo_code})
                     i += 1
-            if failure: 
+            if failure:
                 error = f'[INFO - {self.client_name.upper()}] No Token Located for {geo_code.upper()}'
                 return None, error
 
@@ -527,7 +403,7 @@ class Client:
         if args and args.get('newregion'):
             new_region = self.parse_newregion(args.get('newregion'))
             new_geo = list(new_region.keys())[0] if len(new_region) > 0 else None
-            if new_geo: 
+            if new_geo and new_geo not in geo_list:
                 geo_list.append(new_geo)
                 new_args = dict(args)
                 regions_val = args.get('regions')
@@ -571,7 +447,7 @@ class Client:
             self.sessionAt = time.time()
             self.session_expires_in = session_expires_in
         return channels_by_geo, error
-    
+
     def generate_channels(self, stations, genre_slug, genre, headers, params, geo_code):
         url = f'https://epg.provider.plex.tv/lineups/plex/channels?genre={genre_slug}'
         error = None
@@ -593,7 +469,7 @@ class Client:
         if response.status_code != 200:
             print(f'[ERROR - {self.client_name.upper()}] HTTP Failure {response.status_code} for {geo_code}/{genre_slug}: {response.text}')
             return stations
-        
+
         resp = response.json()
 
         channels = resp.get("MediaContainer").get("Channel")
@@ -634,10 +510,11 @@ class Client:
                 note = f"[INFO - {self.client_name.upper()}] {title} has DRM set. Skipping."
                 print(note)
             else:
+                resolved_logo = self.resolve_logo_url(id, logo)
                 new_item = {'call_sign': callSign,
                                       'slug': slug,
                                       'name': title,
-                                      'logo': logo,
+                                      'logo': resolved_logo,
                                       'id': id,
                                       'key': plex_key,
                                       'gridKey': gridKey,
@@ -655,6 +532,102 @@ class Client:
 
         return stations
 
+    # ==== Streaming Playlist ====
+    def generate_m3u(self, provider, listings, gracenote, channel_id_type, base_url):
+        local_token_keychain = self.token_keychain.copy()
+        self.proxy_map = {}  # Maps slugs to full stream URLs for proxying
+        m3u = "#EXTM3U\r\n\r\n"
+
+        for s in listings:
+            geo_code = s.get('geo_code', '')
+            token = local_token_keychain.get(geo_code, {}).get('access_token')
+
+            # Extract and register short proxy mapping
+            slug = s.get('slug')
+            key = s.get('key')
+            token = local_token_keychain.get(geo_code, {}).get('access_token')
+            stream_url = f"https://epg.provider.plex.tv{key}?X-Plex-Token={token}" if key else None
+
+            # Register proxy mapping
+            if slug and stream_url:
+                self.proxy_map[slug] = stream_url
+
+            # Determine local proxy path (HLS variant vs direct stream)
+            if key and key.endswith('.m3u8'):
+                stream_path = f"{base_url}/hls/{slug}.m3u8"
+            else:
+                stream_path = f"{base_url}/stream/{slug}"
+
+            # Build EXTINF metadata
+            channel_id = f"{provider}-{s.get('id') if channel_id_type == 'matthuisman' else slug}"
+            m3u += f"#EXTINF:-1 channel-id=\"{channel_id}\""
+            m3u += f" tvg-id=\"{s.get('id')}\""
+            m3u += f" tvg-chno=\"{s.get('number')}\"" if s.get('number') else ""
+            if s.get('logo'):
+                logo_url = self.resolve_logo_url(s.get("id"), s.get("logo"))
+                m3u += f' tvg-logo="{logo_url}"'
+            m3u += f" tvg-name=\"{s.get('call_sign')}\"" if s.get('call_sign') else ""
+            if gracenote == 'include':
+                m3u += f" tvg-shift=\"{s.get('time_shift')}\"" if s.get('time_shift') else ""
+                m3u += f" tvc-guide-stationid=\"{s.get('tmsid')}\"" if s.get('tmsid') else ""
+            m3u += f" group-title=\"{''.join(map(str, s.get('group', [])))}\"" if s.get('group') else ""
+            m3u += f",{s.get('name') or s.get('call_sign')}\n"
+            m3u += f"{stream_path}\n\n"
+
+        # Send stream map to proxy
+        try:
+            requests.post(f"{base_url}/register", json=self.proxy_map)
+        except Exception as e:
+            print(f"[WARNING - {self.client_name.upper()}] Failed to register stream map: {e}")
+
+        return m3u
+
+    def generate_playlist(self, provider, args, host):
+        from flask import request
+        base_url = request.host_url.rstrip("/")
+
+        error = None
+        station_dict, error = self.channels(args)
+        if error: return None, error
+
+        geo_list = self.generate_geo_list(args)
+        # print(f'[INFO - {self.client_name.upper()}] generate_playlist: {geo_list}')
+
+        playlist_dict = {}
+        for geo_code in geo_list:
+            channels_by_geo = station_dict.get(geo_code)
+            for ch in channels_by_geo:
+                if not (ch in playlist_dict):
+                    station_data = channels_by_geo.get(ch)
+                    station_data.update({'geo_code': geo_code})
+                    playlist_dict.update({ch: station_data})
+
+        # listings = sorted(playlist_dict.values(), key = lambda i: i.get('name', ''))
+        listings = sorted(
+            playlist_dict.values(),
+            key=lambda i: (
+                            (i.get('call_sign') is None, i.get('call_sign', '')),
+                            i.get('tmsid') is None,
+                            i.get('name').lower() or '')
+            )
+
+        print(f'[INFO - {self.client_name.upper()}] Full Playlist: {len(listings)}')
+
+        gracenote = args.get('gracenote')
+        if gracenote == 'include':
+            listings = list(filter(lambda d: d.get('tmsid'), listings))
+            print(f'[INFO - {self.client_name.upper()}] Gracenote Playlist: {len(listings)}')
+        elif gracenote == 'exclude':
+            listings = list(filter(lambda d: d.get('tmsid', None) is None, listings))
+            print(f'[INFO - {self.client_name.upper()}] No Gracenote Playlist: {len(listings)}')
+
+        channel_id_type = args.get('compatibility')
+
+        m3u = self.generate_m3u(provider, listings, gracenote, channel_id_type, base_url)
+        return m3u, error
+
+
+# ==== Epg Generation ====
     def read_epg_from_api(self, date, station):
         # print(f"[DEBUG - {self.client_name.upper()}:read_epg_from_api] Begin Function {station.get('gridKey')} {station.get('geo_code')}")
         url =  "https://epg.provider.plex.tv/grid"
@@ -675,10 +648,10 @@ class Client:
                         'x-plex-token': token,
                         'x-plex-version': '4.145.1',
                     }
-       
+
         epg_params = {'channelGridKey': grid_key,
                         'date': date}
-        
+
         session = requests.Session()
 
         # Configure retries
@@ -698,7 +671,7 @@ class Client:
         has_error = False
         try:
             response = session.get(url, params=epg_params, headers=epg_headers, timeout=10)
-            response.raise_for_status() 
+            response.raise_for_status()
         except requests.ConnectionError as e:
             print(f"[ERROR - {self.client_name.upper()}]: Connection Error. {str(e)}")
             has_error = True
@@ -712,16 +685,16 @@ class Client:
             session.close()
         del session
         gc.collect()
-        
+
         if response.status_code != 200:
             print(f'[ERROR - {self.client_name.upper()}] EPG HTTP Failure {response.status_code}')
             return None
-        
+
         content_type = response.headers.get("Content-Type", "").lower()
         if "application/xml" in content_type or "text/xml" in content_type:
             return response.text
         return None
-        
+
     def generate_epg_station_list(self, channels_by_geo):
         epg_dict = {}
         for geo_loc in channels_by_geo:
@@ -911,7 +884,7 @@ class Client:
                                 unique_channels.add(channel_id)
                                 channel_elements.append(ET.tostring(elem, encoding="utf-8"))
                             elem.clear()  # Free memory
-                ch_file = file   
+                ch_file = file
             # Write all <channel> elements at the beginning
             num_of_channels = len(channel_elements)
             for channel in channel_elements:
@@ -919,7 +892,6 @@ class Client:
 
             del elem
             gc.collect()
-            
 
             # SECOND PASS: Collect Channels
             num_media_items = 0
@@ -930,7 +902,7 @@ class Client:
                         num_media_items += 1
                         f_out.write(ET.tostring(elem, encoding="utf-8"))
                         elem.clear()  # Free memory
-                p_file = file   
+                p_file = file
 
             del elem
             gc.collect()
@@ -988,9 +960,7 @@ class Client:
                 for event, elem in context:
                     if event == "end" and elem.tag == "tv":
                         grid_key = elem.attrib.get("channelGridKey")
-                        #print(f"grid_key: {grid_key}")
                         station = epg_channels.get(grid_key)
-                        #print(f"station: {station}")
 
                         if station:
                             station_id = station.get("id")
@@ -998,10 +968,18 @@ class Client:
                             # Write channel if not already written
                             if station_id not in written_channels:
                                 written_channels.add(station_id)
+                                # Use fallback CDN if proxy failed
+                                logo_id = station.get("id")
+                                proxy_logo_path = os.path.join("logos", f"{logo_id}.png")
+                                if os.path.exists(proxy_logo_path):
+                                    logo_url = f"{self.get_logo_url(logo_id, use_absolute=True)}"
+                                else:
+                                    logo_url = station.get("logo")  # Original fallback CDN URL
+
                                 epg_file.write(
                                     f'<channel id="{station_id}">'
                                     f'<display-name>{escape(station.get("name"))}</display-name>'
-                                    f'<icon src="{station.get("logo")}" />'
+                                    f'<icon src="{logo_url}" />'
                                     '</channel>\n'.encode("utf-8")
                                 )
 
@@ -1044,7 +1022,6 @@ class Client:
         video_type = video.attrib.get("type", "").lower()
         genres = [escape(genre.attrib.get("tag")) for genre in video.findall("Genre")]
             
-
         if video_type == "movie":
             if any(genre.lower() == "news" for genre in genres):
                 title = escape(f'{video.attrib.get("title", "")}')
@@ -1076,7 +1053,7 @@ class Client:
             for genre in genres:
                 programme += f'<category>{genre}</category>'
                   
-
+            # Use grandparent_art directly as it was in the original code
             if grandparent_art:
                 programme += f'<icon src="{grandparent_art}" />'
             if originally_available_at:
@@ -1090,3 +1067,131 @@ class Client:
             programme += '</programme>\n'
 
             epg_file.write(programme.encode("utf-8"))
+
+    def _start_token_refresh_thread(self):
+        def refresh_loop():
+            while True:
+                time.sleep(60 * 60 * 5)  # Refresh every 5 hours
+                try:
+                    geo_codes = list(self.x_forward.keys())
+                    for geo in geo_codes:
+                        self.token({'regions': geo})
+                    print(f"[INFO - {self.client_name.upper()}] Background token refresh complete")
+                except Exception as e:
+                    print(f"[WARNING - {self.client_name.upper()}] Token refresh failed: {e}")
+
+        t = threading.Thread(target=refresh_loop, daemon=True)
+        t.start()
+
+# ==== Helpers ====
+    def resolve_logo_url(self, station_id, fallback_url):
+        """
+        Return the correct logo URL: proxy path if logo was cached, otherwise fallback to CDN.
+        This ensures consistency between M3U and EPG.
+        """
+        logo_path = os.path.join("logos", f"{station_id}.png")
+        if os.path.exists(logo_path):
+            return self.get_logo_url(station_id, use_absolute=True)
+        else:
+            return fallback_url
+
+    def isTimeExpired(self, sessionAt, age):
+        # print ((time.time() - sessionAt) >= age)
+        return ((time.time() - sessionAt) >= age)
+
+    def generate_video_url(self, id):
+        """
+        Generate a direct video URL for a given stream ID.
+        This method is called by the watch endpoint.
+        """
+        try:
+            # Check if ID is a slug that exists in the proxy map
+            if hasattr(self, 'proxy_map') and id in self.proxy_map:
+                return self.proxy_map[id], None
+            
+            # If not in proxy map, try to generate a URL from the token
+            # This assumes the ID is a channel ID or slug
+            local_token_keychain = self.token_keychain.copy()
+            for geo_code in local_token_keychain:
+                token = local_token_keychain[geo_code].get('access_token')
+                if token:
+                    # Try to construct a URL - this will need to be customized based on
+                    # how Plex structures its stream URLs
+                    video_url = f"https://epg.provider.plex.tv/stream/{id}?X-Plex-Token={token}"
+                    return video_url, None
+                    
+            return None, "Unable to find stream for ID"
+        except Exception as e:
+            return None, f"Error generating video URL: {str(e)}"
+            
+    def url_encode(self, base_url, params):
+        query_string = urlencode(params)
+        full_url = f"{base_url}?{query_string}" if query_string else base_url
+        return full_url
+
+    def get_logo_url(self, station_id, use_absolute=False):
+        if use_absolute:
+            try:
+                from flask import has_request_context, request
+                if has_request_context():
+                    base_url = request.host_url.rstrip("/")
+                    return f"{base_url}/logo/{station_id}.png"
+            except Exception:
+                pass  # Fail silently and fall through to relative
+        return f"/logo/{station_id}.png"
+
+    def body_text(self, provider, host, geo_code_list):
+        local_x_forward = self.x_forward.copy()
+        local = ['local']
+        base_url = f"http://{host}/{provider}/playlist.m3u"
+        body_text = f'<p class="title is-4">{provider.capitalize()} Playlist</p>'
+        options = '<span class="tag is-link is-light is-medium is-rounded mb-5">Multiple Region parameters can be used with comma seperator. Example: playlist.m3u?regions=local,la</span>'
+        options += '<div class="columns is-multiline is-variable is-5">'
+        for elem in local_x_forward:
+            options += ''
+            options += '<div class="column is-one-quarter mb-0"><div class="button is-info is-dark">'
+            if elem != 'local':
+                params = {'regions': elem}
+            else:
+                params = {}
+            full_url = self.url_encode(base_url, params)
+            options += f'<a href="{full_url}" class="has-text-white">{elem.upper()} Playlist Default</a>'
+            options += '</div></div>'
+            options += '<div class="column is-one-quarter mb-0"><div class="button is-info is-dark">'
+            params.update({'compatibility': 'matthuisman'})
+            full_url = self.url_encode(base_url, params)
+            options += f'<a href="{full_url}" class="has-text-white">{elem.upper()} Playlist Type MJH</a>'
+            params.pop('compatibility', None)
+            options += '</div></div>'
+            options += '<div class="column is-one-quarter mb-0"><div class="button is-info is-dark">'
+            params.update({'gracenote': 'include'})
+            full_url = self.url_encode(base_url, params)
+            options += f'<a href="{full_url}" class="has-text-white">{elem.upper()} Gracenote Playlist</a>'
+            options += '</div></div>'
+            options += '<div class="column is-one-quarter mb-0"><div class="button is-info is-dark">'
+            params.update({'gracenote': 'exclude'})
+            full_url = self.url_encode(base_url, params)
+            options += f'<a href="{full_url}" class="has-text-white">{elem.upper()} Playlist No Gracenote</a>'
+            options += '</div></div>'
+        options += '</div>'
+        tools = '<div class="columns is-multiline is-variable is-5">'
+        tools += '<div class="column is-third mb-0"><div class="button is-danger is-dark">'
+        tools += f'<a href="http://{host}/{provider}/rebuild_epg" class="has-text-white">Rebuild EPG</a>'
+        tools += '</div></div>'
+        tools += '<div class="column is-third mb-0"><div class="button is-primary is-dark">'
+        tools += f'<a href="http://{host}/{provider}/epg.xml" class="has-text-white">EPG</a>'
+        tools += '</div></div>'
+        tools += '<div class="column is-third mb-0"><div class="button is-primary is-dark">'
+        tools += f'<a href="http://{host}/{provider}/epg.xml.gz" class="has-text-white">EPG GZ</a>'
+        tools += '</div></div>'
+        tools += '</div>'
+        return(f'{body_text}{tools}{options}')
+
+    def generate_group_listing(self, token, geo_code):
+        error = None
+        local_headers = self.headers.copy()
+        local_x_forward = self.x_forward.copy()
+        if geo_code in local_x_forward.keys():
+            local_headers.update({"X-Forwarded-For": local_x_forward.get(geo_code)})
+        group_listing = local_headers
+        return group_listing, error
